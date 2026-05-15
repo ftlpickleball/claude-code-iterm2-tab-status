@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "iterm2-tab-status",
-      "source": "."
+      "source": "./."
     }
   ]
 }
