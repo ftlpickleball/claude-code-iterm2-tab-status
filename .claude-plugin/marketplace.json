@@ -1,0 +1,12 @@
+{
+  "name": "ftlpickleball",
+  "owner": {
+    "name": "ftlpickleball"
+  },
+  "plugins": [
+    {
+      "name": "iterm2-tab-status",
+      "source": "."
+    }
+  ]
+}

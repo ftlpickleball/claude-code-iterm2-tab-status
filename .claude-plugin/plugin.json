@@ -5,7 +5,7 @@
   "author": {
     "name": "Jasper Sui"
   },
-  "repository": "https://github.com/JasperSui/claude-code-iterm2-tab-status",
+  "repository": "https://github.com/ftlpickleball/claude-code-iterm2-tab-status",
   "license": "MIT",
   "keywords": ["iterm2", "tab", "notification", "status"]
 }
