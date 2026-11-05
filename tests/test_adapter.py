@@ -5,10 +5,14 @@ Runs outside iTerm2 by mocking the iterm2 module.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import os
 import sys
 import time
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1031,3 +1035,288 @@ class TestEscapeInterpolation:
 
     def test_escapes_backslashes_so_prefixes_are_not_evaluated(self):
         assert claude_tab_status.escape_interpolation(r"\(pid) ") == r"\\(pid) "
+
+
+# --- Session name stability, driven through the real main() loop ---
+
+_REAL_SLEEP = asyncio.sleep
+_JOB_SUFFIX = " (claude)"
+_LIVE_TITLE_OVERRIDE = r"⚡ \(currentSession.name)"
+
+
+class FakeSession:
+    """Renders ``name`` as format + job suffix, as measured on iTerm2 sessions."""
+
+    def __init__(self, title: str, tty: str = "/dev/ttys042") -> None:
+        self.format = title
+        self.pinned = False
+        self.tty = tty
+        self.session_id = "iterm-1"
+        profile = MagicMock(tab_color=None, use_tab_color=False, badge_text="")
+        self.async_get_profile = AsyncMock(return_value=profile)
+        self.async_set_profile_properties = AsyncMock()
+        self.async_set_variable = AsyncMock()
+        self.async_set_name = AsyncMock(side_effect=self._set_name)
+
+    def _set_name(self, name: str) -> None:
+        self.format = name
+        self.pinned = True
+
+    def receive_terminal_title(self, title: str) -> None:
+        """A manually set name stops OSC titles reaching the session."""
+        if not self.pinned:
+            self.format = title
+
+    @property
+    def rendered(self) -> str:
+        return self.format + _JOB_SUFFIX
+
+    async def async_get_variable(self, name: str) -> object:
+        return {
+            "name": self.rendered,
+            "autoName": self.format,
+            "autoNameFormat": self.format,
+            "tty": self.tty,
+        }.get(name)
+
+
+class FakeTab:
+    def __init__(self, session: FakeSession, override: str | None = None) -> None:
+        self.sessions = [session]
+        self.override = override
+        self.titles: list[str] = []
+        self.read_error = False
+        self.write_error = False
+
+    async def async_get_variable(self, name: str) -> object:
+        if self.read_error:
+            raise RuntimeError("tab variable unavailable")
+        return self.override if name == "titleOverrideFormat" else None
+
+    async def async_set_title(self, title: str) -> None:
+        if self.write_error:
+            raise RuntimeError("tab title unavailable")
+        self.titles.append(title)
+        self.override = title
+
+
+class FakeFocusMonitor:
+    def __init__(self) -> None:
+        self.updates: asyncio.Queue[object] = asyncio.Queue()
+
+    async def __aenter__(self) -> FakeFocusMonitor:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def async_get_next_update(self) -> object:
+        return await self.updates.get()
+
+
+async def _settle() -> None:
+    """Fakes never suspend, so each yield runs at most one full watcher pass."""
+    for _ in range(50):
+        await _REAL_SLEEP(0)
+
+
+def _focus_update(session_id: str) -> MagicMock:
+    update = MagicMock()
+    update.active_session_changed.session_id = session_id
+    return update
+
+
+def _signal(signal_type: str = "idle", tty: str = "/dev/ttys042", age: int = 0) -> dict:
+    return {
+        "session_id": "ses-1",
+        "type": signal_type,
+        "tty": tty,
+        "pid": str(os.getpid()),
+        "ts": str(int(time.time()) - age),
+    }
+
+
+@pytest.fixture
+def adapter_env(monkeypatch: pytest.MonkeyPatch, signal_dir: Path) -> Path:
+    """Isolate from the user's config: a reload would point at the live signal dir."""
+    module = claude_tab_status
+    monkeypatch.setattr(module, "CONFIG_PATH", str(signal_dir / "no-config.json"))
+    monkeypatch.setattr(module, "ALL_PREFIXES", ["⚡ ", "💤 ", "🔴 "])
+    monkeypatch.setattr(
+        module,
+        "_STATE_PREFIXES",
+        {
+            module.TabState.RUNNING: "⚡ ",
+            module.TabState.IDLE: "💤 ",
+            module.TabState.ATTENTION: "🔴 ",
+        },
+    )
+    settings = {
+        "dir": str(signal_dir),
+        "display_target": "title",
+        "flash_enabled": False,
+        "badge_enabled": False,
+        "notify": False,
+        "sound": "",
+        "signal_max_age": 1800,
+    }
+    for key, value in settings.items():
+        monkeypatch.setitem(module.CONFIG, key, value)
+    monkeypatch.setattr(asyncio, "sleep", lambda _delay: _REAL_SLEEP(0))
+    return signal_dir
+
+
+@asynccontextmanager
+async def running_adapter(tab: FakeTab) -> AsyncGenerator[FakeFocusMonitor, None]:
+    monitor = FakeFocusMonitor()
+    app = MagicMock(terminal_windows=[MagicMock(tabs=[tab])])
+    with (
+        patch.object(mock_iterm2, "async_get_app", AsyncMock(return_value=app)),
+        patch.object(mock_iterm2, "FocusMonitor", MagicMock(return_value=monitor)),
+    ):
+        task = asyncio.ensure_future(claude_tab_status.main(MagicMock()))
+        await _settle()
+        try:
+            yield monitor
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def _run_cycle(signal_dir: Path, signal_type: str = "idle") -> None:
+    """One session lifetime: capture on the new signal, restore when it goes away."""
+    path = write_signal(signal_dir, _signal(signal_type))
+    await _settle()
+    path.unlink()
+    await _settle()
+
+
+class TestSessionNameStability:
+    async def test_tab_path_never_writes_session_name(self, adapter_env: Path):
+        session = FakeSession("PM")
+        async with running_adapter(FakeTab(session)):
+            for _ in range(5):
+                await _run_cycle(adapter_env)
+
+        assert session.rendered == "PM" + _JOB_SUFFIX
+        session.async_set_name.assert_not_awaited()
+
+    async def test_terminal_title_stays_live_across_cycles(self, adapter_env: Path):
+        session = FakeSession("Claude Code")
+        async with running_adapter(FakeTab(session)):
+            await _run_cycle(adapter_env)
+            session.receive_terminal_title("Kicad")
+            await _run_cycle(adapter_env)
+            session.receive_terminal_title("Sourcing")
+
+        assert session.format == "Sourcing"
+
+    async def test_focus_dismissed_attention_does_not_grow(self, adapter_env: Path):
+        session = FakeSession("PM")
+        async with running_adapter(FakeTab(session)) as monitor:
+            for _ in range(3):
+                write_signal(adapter_env, _signal("attention"))
+                await _settle()
+                monitor.updates.put_nowait(_focus_update(session.session_id))
+                await _settle()
+                assert not (adapter_env / "ses-1.json").exists()
+                monitor.updates.put_nowait(_focus_update("other-session"))
+                await _settle()
+
+        assert session.rendered == "PM" + _JOB_SUFFIX
+        session.async_set_name.assert_not_awaited()
+
+    async def test_expired_signal_clears_without_name_write(self, adapter_env: Path):
+        session = FakeSession("PM")
+        async with running_adapter(FakeTab(session)):
+            write_signal(adapter_env, _signal(age=7200))
+            await _settle()
+
+        assert not (adapter_env / "ses-1.json").exists()
+        session.async_set_name.assert_not_awaited()
+
+    async def test_existing_stack_stays_constant(self, adapter_env: Path):
+        stacked = "PM" + _JOB_SUFFIX * 3
+        session = FakeSession(stacked)
+        async with running_adapter(FakeTab(session)):
+            for _ in range(3):
+                await _run_cycle(adapter_env)
+
+        assert session.format == stacked
+
+    @pytest.mark.parametrize("broken", ["read_error", "write_error"])
+    async def test_fallback_prefixes_then_restores_without_growth(
+        self, adapter_env: Path, broken: str
+    ):
+        session = FakeSession("PM")
+        tab = FakeTab(session)
+        async with running_adapter(tab):
+            setattr(tab, broken, True)
+            for _ in range(5):
+                path = write_signal(adapter_env, _signal())
+                await _settle()
+                assert session.format == "💤 PM"
+                path.unlink()
+                await _settle()
+                assert session.rendered == "PM" + _JOB_SUFFIX
+
+    async def test_display_target_change_marks_name_changed(self, adapter_env: Path):
+        session = FakeSession("⚡ PM")
+        snapshot = claude_tab_status.Snapshot(None, False, "⚡ PM", "", True)
+        active = {"ses-1": {"session": session, "snapshot": snapshot, "tab": None, "state": None}}
+
+        await claude_tab_status._handle_display_target_change(
+            active, "title", "subtitle", AsyncMock()
+        )
+
+        assert session.format == "PM"
+        assert snapshot.name_changed is True
+
+    async def test_capture_reads_format_not_rendered_name(self):
+        snapshot = await claude_tab_status.capture_snapshot(FakeSession("PM"))
+
+        assert snapshot.name == "PM"
+        assert snapshot.name_changed is False
+
+
+class TestTabOverrideBehaviour:
+    async def test_override_tracks_live_session_name(self, adapter_env: Path):
+        tab = FakeTab(FakeSession("PM"))
+        async with running_adapter(tab):
+            path = write_signal(adapter_env, _signal("running"))
+            await _settle()
+            assert tab.override == _LIVE_TITLE_OVERRIDE
+            path.unlink()
+            await _settle()
+
+        assert tab.override == ""
+
+    async def test_user_override_is_base_and_restored(self, adapter_env: Path):
+        tab = FakeTab(FakeSession("PM"), override="prod")
+        async with running_adapter(tab):
+            path = write_signal(adapter_env, _signal("running"))
+            await _settle()
+            assert tab.override == "⚡ prod"
+            path.unlink()
+            await _settle()
+
+        assert tab.override == "prod"
+
+    async def test_startup_clears_stale_stacked_literal(self, adapter_env: Path):
+        tab = FakeTab(FakeSession("PM"), override="⚡ Claude Code (claude) (claude)")
+        async with running_adapter(tab):
+            assert tab.override == ""
+
+    async def test_capture_rejects_stale_stacked_literal(self, adapter_env: Path):
+        tab = FakeTab(FakeSession("PM"))
+        async with running_adapter(tab):
+            tab.override = "💤 Claude Code (claude) (claude)"
+            write_signal(adapter_env, _signal("running"))
+            await _settle()
+
+            assert tab.override == _LIVE_TITLE_OVERRIDE
+
+    def test_no_space_prefix_recognizes_stale_literal(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(claude_tab_status, "ALL_PREFIXES", ["⚡", "💤", "🔴"])
+
+        assert claude_tab_status.is_plugin_tab_override("⚡Claude Code (claude) (claude)")

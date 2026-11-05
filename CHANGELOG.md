@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1 — 2026-11-04
+
+### Fixed
+- **Session names no longer stack ` (claude)` suffixes or freeze.** The adapter snapshotted the rendered `name`, which includes iTerm2's job suffix, and wrote it back on every restore. It now snapshots `autoNameFormat` and writes the name only if it changed it, which happens only when no tab is available. Names already stacked stay as they are until cleaned up.
+
 ## 0.5.0 — 2026-08-20
 
 ### Added
