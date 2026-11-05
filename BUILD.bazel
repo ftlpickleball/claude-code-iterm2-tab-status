@@ -1,0 +1,92 @@
+load("@pip_tab_status//:requirements.bzl", "requirement")
+load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_shell//shell:sh_test.bzl", "sh_test")
+load("@rules_shellcheck//:def.bzl", "shellcheck_test")
+load("//tools/bazel:lint.bzl", "py_ruff_test")
+load("//tools/bazel:pytest.bzl", "py_pytest_test")
+
+exports_files(["uv.lock"])
+
+py_library(
+    name = "adapter",
+    srcs = ["scripts/claude_tab_status.py"],
+    imports = ["scripts"],
+)
+
+# The adapter loads the user's config on import; a HOME without one keeps results host-independent.
+py_pytest_test(
+    name = "test_adapter",
+    config = "pyproject.toml",
+    env = {"HOME": "/nonexistent/bazel-test-home"},
+    tests = ["tests/test_adapter.py"],
+    deps = [
+        ":adapter",
+        requirement("pytest"),
+        requirement("pytest-asyncio"),
+    ],
+)
+
+# The scripts find the repo root as dirname($0)/.., so the test symlinks must sit under tests/.
+sh_test(
+    name = "tests/test_hooks",
+    size = "small",
+    srcs = ["tests/test_hooks.sh"],
+    data = ["scripts/hook.sh"],
+)
+
+sh_test(
+    name = "tests/test_plugin_structure",
+    size = "small",
+    srcs = ["tests/test_plugin_structure.sh"],
+    data = [
+        ".claude-plugin/marketplace.json",
+        ".claude-plugin/plugin.json",
+        "hooks/hooks.json",
+        "scripts/bootstrap.sh",
+        "scripts/claude_tab_status.py",
+        "scripts/hook.sh",
+    ] + glob(["commands/*.md"]),
+)
+
+py_ruff_test(
+    name = "ruff",
+    srcs = glob([
+        "scripts/*.py",
+        "tests/*.py",
+    ]),
+    config = "pyproject.toml",
+    ruff_args = [
+        "check",
+        "scripts",
+        "tests",
+    ],
+    ruff_files = "@pip_tab_status//ruff:extracted_whl_files",
+    deps = [requirement("ruff")],
+)
+
+py_ruff_test(
+    name = "ruff_format",
+    srcs = glob([
+        "scripts/*.py",
+        "tests/*.py",
+    ]),
+    config = "pyproject.toml",
+    ruff_args = [
+        "format",
+        "--check",
+        "scripts",
+        "tests",
+    ],
+    ruff_files = "@pip_tab_status//ruff:extracted_whl_files",
+    deps = [requirement("ruff")],
+)
+
+shellcheck_test(
+    name = "shellcheck",
+    data = glob([
+        "scripts/*.sh",
+        "tests/*.sh",
+    ]),
+    format = "gcc",
+    severity = "warning",
+)

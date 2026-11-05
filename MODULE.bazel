@@ -1,0 +1,28 @@
+module(
+    name = "claude_code_iterm2_tab_status",
+    version = "0.0.0",
+)
+
+bazel_dep(name = "bazel_skylib", version = "1.9.2")
+bazel_dep(name = "rules_python", version = "2.4.6")
+bazel_dep(name = "rules_shell", version = "0.8.0")
+bazel_dep(name = "rules_shellcheck", version = "0.7.0")
+
+# Keep in sync with python_version in .bazelrc.
+PYTHON_VERSION = "3.14"
+
+python = use_extension("@rules_python//python/extensions:python.bzl", "python")
+python.toolchain(
+    python_version = PYTHON_VERSION,
+    is_default = True,
+)
+
+# requirements_lock is structurally required; the uv path never reads it.
+pip = use_extension("@rules_python//python/extensions:pip.bzl", "pip")
+pip.parse(
+    hub_name = "pip_tab_status",
+    python_version = PYTHON_VERSION,
+    requirements_lock = "//:uv.lock",
+    uv_lock = "//:uv.lock",
+)
+use_repo(pip, "pip_tab_status")

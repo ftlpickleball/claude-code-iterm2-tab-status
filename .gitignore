@@ -6,6 +6,8 @@ __pycache__/
 dist/
 build/
 .venv/
+bazel-*
+user.bazelrc
 .DS_Store
 marketing/
 docs/plans/
