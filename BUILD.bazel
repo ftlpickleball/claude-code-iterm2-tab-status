@@ -1,9 +1,8 @@
 load("@pip_tab_status//:requirements.bzl", "requirement")
-load("@rules_python//python:defs.bzl", "py_library")
+load("@rules_python//python:defs.bzl", "py_library", "py_test")
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 load("@rules_shellcheck//:def.bzl", "shellcheck_test")
 load("//tools/bazel:lint.bzl", "py_ruff_test")
-load("//tools/bazel:pytest.bzl", "py_pytest_test")
 
 exports_files(["uv.lock"])
 
@@ -14,11 +13,21 @@ py_library(
 )
 
 # The adapter loads the user's config on import; a HOME without one keeps results host-independent.
-py_pytest_test(
+py_test(
     name = "test_adapter",
-    config = "pyproject.toml",
+    size = "small",
+    srcs = ["tests/test_adapter.py"],
+    args = [
+        "-ra",
+        "-p",
+        "no:cacheprovider",
+        "-c",
+        "$(rootpath pyproject.toml)",
+        "$(rootpath tests/test_adapter.py)",
+    ],
+    data = ["pyproject.toml"],
     env = {"HOME": "/nonexistent/bazel-test-home"},
-    tests = ["tests/test_adapter.py"],
+    main_module = "pytest",
     deps = [
         ":adapter",
         requirement("pytest"),
