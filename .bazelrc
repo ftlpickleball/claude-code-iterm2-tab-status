@@ -1,0 +1,10 @@
+# Keep in sync with PYTHON_VERSION in MODULE.bazel.
+build --@rules_python//python/config_settings:python_version=3.14
+
+# Never synthesize __init__.py in runfiles.
+build --incompatible_default_to_explicit_init_py
+
+test --test_output=errors
+test --test_summary=terse
+
+try-import %workspace%/user.bazelrc
