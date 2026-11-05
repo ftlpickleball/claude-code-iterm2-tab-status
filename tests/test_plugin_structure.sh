@@ -38,13 +38,14 @@ else
   fail "hooks.json" "file not found"
 fi
 
-echo "Test: marketplace.json source is a ./ relative path"
+echo "Test: marketplace.json source is the fork's github source"
 MARKETPLACE_JSON="$PROJECT_ROOT/.claude-plugin/marketplace.json"
-source_path=$(python3 -c "import json; print(json.load(open('$MARKETPLACE_JSON'))['plugins'][0]['source'])" 2>/dev/null || echo "")
-if [[ "$source_path" == ./* ]]; then
-  pass "marketplace source '$source_path' starts with ./"
+# Claude Code refuses "." and "./." as plugin source paths, and validate does not catch it.
+plugin_source=$(python3 -c "import json; s = json.load(open('$MARKETPLACE_JSON'))['plugins'][0]['source']; print(s['source'], s['repo'])" 2>/dev/null || echo "")
+if [[ "$plugin_source" == "github ftlpickleball/claude-code-iterm2-tab-status" ]]; then
+  pass "marketplace source is '$plugin_source'"
 else
-  fail "marketplace source" "expected a ./ path, got '$source_path'"
+  fail "marketplace source" "expected the github source form, got '$plugin_source'"
 fi
 
 # ── 2. plugin.json has required fields ──────────────────────────────────────
