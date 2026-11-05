@@ -38,6 +38,15 @@ else
   fail "hooks.json" "file not found"
 fi
 
+echo "Test: marketplace.json source is a ./ relative path"
+MARKETPLACE_JSON="$PROJECT_ROOT/.claude-plugin/marketplace.json"
+source_path=$(python3 -c "import json; print(json.load(open('$MARKETPLACE_JSON'))['plugins'][0]['source'])" 2>/dev/null || echo "")
+if [[ "$source_path" == ./* ]]; then
+  pass "marketplace source '$source_path' starts with ./"
+else
+  fail "marketplace source" "expected a ./ path, got '$source_path'"
+fi
+
 # ── 2. plugin.json has required fields ──────────────────────────────────────
 
 echo ""

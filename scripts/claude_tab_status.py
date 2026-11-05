@@ -325,6 +325,8 @@ class Snapshot:
     name: str
     badge_text: str
     allow_title_setting: bool
+    # Writing the name pins it against terminal titles, so restore only what we changed.
+    name_changed: bool = False
 
 
 async def capture_snapshot(session: object) -> Snapshot:
@@ -341,7 +343,8 @@ async def capture_snapshot(session: object) -> Snapshot:
         if tc
         else None,
         use_tab_color=bool(profile.use_tab_color),
-        name=await session.async_get_variable("name") or "",  # type: ignore[union-attr]
+        # "name" includes iTerm2's job suffix; writing it back stacks another one.
+        name=await session.async_get_variable("autoNameFormat") or "",  # type: ignore[union-attr]
         badge_text=profile.badge_text or "",
         allow_title_setting=bool(getattr(profile, "allow_title_setting", True)),
     )
@@ -363,7 +366,14 @@ async def restore_snapshot(session: object, snapshot: Snapshot) -> None:
         )
     change.set_badge_text(snapshot.badge_text)
     await session.async_set_profile_properties(change)  # type: ignore[union-attr]
-    await session.async_set_name(snapshot.name)  # type: ignore[union-attr]
+    if snapshot.name_changed:
+        await session.async_set_name(snapshot.name)  # type: ignore[union-attr]
+
+
+async def _set_session_name(info: dict, name: str) -> None:
+    """Write the session name, recording that restore must put it back."""
+    info["snapshot"].name_changed = True
+    await info["session"].async_set_name(name)  # type: ignore[union-attr]
 
 
 # --- Session Matching ---
@@ -673,7 +683,7 @@ async def _handle_display_target_change(
                     await tab.async_set_title(info.get("orig_tab_title", ""))
                 else:
                     clean = strip_all_prefixes(info["snapshot"].name)
-                    await info["session"].async_set_name(clean)  # type: ignore[union-attr]
+                    await _set_session_name(info, clean)
             except Exception:
                 log.debug("Failed to clear title prefix on display_target change")
 
@@ -833,9 +843,7 @@ async def main(connection: object) -> None:
                 info["tab"] = None
         if not tab:
             clean = strip_all_prefixes(info["snapshot"].name)
-            await info["session"].async_set_name(  # type: ignore[union-attr]
-                set_state_prefix(clean, prefix)
-            )
+            await _set_session_name(info, set_state_prefix(clean, prefix))
 
     def _start_flash(claude_sid: str) -> None:
         """Begin flashing a session's tab (idempotent)."""
