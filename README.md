@@ -31,6 +31,18 @@ After the first session, **restart iTerm2** (or toggle **Scripts** → **AutoLau
 
 ![Initial Setup](assets/initial-setup.jpg)
 
+### Updating
+
+To update to the latest release:
+
+```bash
+claude plugin update iterm2-tab-status@jaspersui-marketplace
+```
+
+This re-fetches the plugin and installs the newest version on its own — you do **not** need to run `/plugin marketplace update` first (that only refreshes the catalog listing). After updating, **restart the iTerm2 adapter** (close and reopen iTerm2, or toggle **Scripts** → **AutoLaunch** → **claude_tab_status.py**) so it picks up any adapter-side changes.
+
+See [CHANGELOG.md](CHANGELOG.md) for what's in each release.
+
 
 ### Manual Setup
 
@@ -58,11 +70,13 @@ claude plugin uninstall iterm2-tab-status
 | ---------------------------------- | ------ | -------------- | ----- | ---------------- |
 | **Running** — Claude is processing | ⚡      | No change      | No    | No               |
 | **Idle** — Claude finished         | 💤      | No change      | No    | No               |
-| **Attention** — needs permission   | 🔴      | Flashes orange | Yes   | Yes              |
+| **Attention** — needs permission or an answer | 🔴 | Flashes orange | Yes | Yes |
 
-Lifecycle: `User submits → ⚡ → Claude finishes → 💤 → User submits → ⚡ → Claude needs permission → 🔴 flash! → User focuses → cleared`
+Lifecycle: `User submits → ⚡ → Claude finishes → 💤 → User submits → ⚡ → Claude needs permission or asks a question → 🔴 flash! → User focuses → cleared`
 
 Your original tab color, title, and badge are saved and restored.
+
+Prefer the prefix/badge without the color flash? Set `"flash_enabled": false` — the badge and notification still fire, just no tab-color flash. It's hot-reloaded, so toggling it off also stops a flash that's already in progress.
 
 ## How it works
 
@@ -70,7 +84,7 @@ Your original tab color, title, and badge are saved and restored.
 Claude Code hooks → JSON signal file → iTerm2 adapter → tab status
 ```
 
-No screen scraping. Claude Code's official [hooks API](https://docs.anthropic.com/en/docs/claude-code/hooks) writes a signal file on every event. The unified hook handles both `UserPromptSubmit` (→ running) and `Notification` (→ idle/attention). The iTerm2 adapter polls for signal files and sets the matching tab's prefix, color, and badge by TTY. Only the attention state flashes and shows a badge — running and idle are informational prefixes that persist.
+No screen scraping. Claude Code's official [hooks API](https://docs.anthropic.com/en/docs/claude-code/hooks) writes a signal file on every event. The unified hook handles `UserPromptSubmit` (→ running), `Notification` (→ idle/attention), and the `AskUserQuestion` tool via `PreToolUse`/`PostToolUse`/`PostToolUseFailure` (question shown → attention; answered → running; cancelled or timed out → idle). The iTerm2 adapter polls for signal files and sets the matching tab's prefix, color, and badge by TTY. Only the attention state flashes and shows a badge — running and idle are informational prefixes that persist.
 
 ## Configuration
 
@@ -93,6 +107,7 @@ Settings are stored in `~/.config/claude-tab-status/config.json`. Example with a
   "color_g": 140,
   "color_b": 0,
   "interval": 0.6,
+  "flash_enabled": true,
   "prefix_running": "⚡ ",
   "prefix_idle": "💤 ",
   "prefix_attention": "🔴 ",
@@ -101,7 +116,8 @@ Settings are stored in `~/.config/claude-tab-status/config.json`. Example with a
   "badge": "⚠️ Needs input",
   "badge_enabled": true,
   "notify": false,
-  "sound": ""
+  "sound": "",
+  "signal_max_age": 1800
 }
 ```
 
@@ -151,6 +167,7 @@ export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1
 | `CLAUDE_ITERM2_TAB_STATUS_COLOR_G`          | `140`                    | Flash color green (0-255)                       |
 | `CLAUDE_ITERM2_TAB_STATUS_COLOR_B`          | `0`                      | Flash color blue (0-255)                        |
 | `CLAUDE_ITERM2_TAB_STATUS_INTERVAL`         | `0.6`                    | Flash interval in seconds                       |
+| `CLAUDE_ITERM2_TAB_STATUS_FLASH_ENABLED`    | `true`                   | Enable/disable tab-color flash (attention only) |
 | `CLAUDE_ITERM2_TAB_STATUS_PREFIX_RUNNING`   | `⚡ `                     | Running state prefix                            |
 | `CLAUDE_ITERM2_TAB_STATUS_PREFIX_IDLE`      | `💤 `                     | Idle state prefix                               |
 | `CLAUDE_ITERM2_TAB_STATUS_PREFIX_ATTENTION` | `🔴 `                     | Attention state prefix                          |
@@ -160,6 +177,7 @@ export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1
 | `CLAUDE_ITERM2_TAB_STATUS_BADGE_ENABLED`    | `true`                   | Enable/disable badge (attention only)           |
 | `CLAUDE_ITERM2_TAB_STATUS_NOTIFY`           | `false`                  | macOS notification (attention only)             |
 | `CLAUDE_ITERM2_TAB_STATUS_SOUND`            | *(empty)*                | Sound file path (attention only)                |
+| `CLAUDE_ITERM2_TAB_STATUS_SIGNAL_MAX_AGE`   | `1800`                   | Reclaim signals not refreshed within N seconds (`0` disables) |
 | `CLAUDE_ITERM2_TAB_STATUS_LOG`              | `WARNING`                | Log level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
 
 </details>
@@ -169,6 +187,8 @@ export CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1
 **Tab doesn't show status** — Check that the iTerm2 Python Runtime is installed. Verify signal files are created: `ls "${XDG_RUNTIME_DIR:-$HOME/.cache}/claude-tab-status/"` after Claude goes idle. Set `export CLAUDE_ITERM2_TAB_STATUS_LOG=DEBUG` and check iTerm2's script console (Scripts → Manage → Console).
 
 **Wrong tab gets prefix** — The TTY in the signal file doesn't match the iTerm2 session. Restart iTerm2.
+
+**Tab stuck on a stale status** (e.g. still showing 🔴 attention after you've responded) — A signal is reclaimed when its PID dies, but the recorded PID is the long-lived login shell, so a signal left behind by a session that has moved on can persist while the tab stays open. The adapter also expires any signal not refreshed within `signal_max_age` seconds (default `1800`); lower it (e.g. `"signal_max_age": 600`) to clear stuck statuses sooner, or set `0` to disable age-based expiry.
 
 ## Contributing
 

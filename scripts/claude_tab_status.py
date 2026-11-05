@@ -27,6 +27,7 @@ Environment variables (all optional):
   CLAUDE_ITERM2_TAB_STATUS_COLOR_G          Flash color green 0-255 (default: 140)
   CLAUDE_ITERM2_TAB_STATUS_COLOR_B          Flash color blue 0-255 (default: 0)
   CLAUDE_ITERM2_TAB_STATUS_INTERVAL         Flash interval seconds (default: 0.6)
+  CLAUDE_ITERM2_TAB_STATUS_FLASH_ENABLED    Enable/disable flash true/false (default: true)
   CLAUDE_ITERM2_TAB_STATUS_PREFIX_RUNNING   Running prefix (default: "⚡ ")
   CLAUDE_ITERM2_TAB_STATUS_PREFIX_IDLE      Idle prefix (default: "💤 ")
   CLAUDE_ITERM2_TAB_STATUS_PREFIX_ATTENTION Attention prefix (default: "🔴 ")
@@ -37,6 +38,8 @@ Environment variables (all optional):
   CLAUDE_ITERM2_TAB_STATUS_BADGE_ENABLED    Enable/disable badge true/false (default: true)
   CLAUDE_ITERM2_TAB_STATUS_NOTIFY           macOS notification true/false (default: false)
   CLAUDE_ITERM2_TAB_STATUS_SOUND            Sound file path (default: "")
+  CLAUDE_ITERM2_TAB_STATUS_SIGNAL_MAX_AGE   Reclaim signals not refreshed within
+                                              N seconds, 0 disables (default: 1800)
   CLAUDE_ITERM2_TAB_STATUS_LOG              Log level (default: WARNING)
 """
 
@@ -49,6 +52,7 @@ import os
 import re
 import subprocess
 import time
+import unicodedata
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -79,12 +83,17 @@ _DEFAULTS: dict[str, object] = {
     "color_g": 140,
     "color_b": 0,
     "interval": 0.6,
+    "flash_enabled": True,
     "badge_enabled": True,
     "badge": "⚠️ Needs input",
     "notify": False,
     "sound": "",
     "display_target": "title",
     "subtitle_activity_source": "off",
+    # Reclaim signals not refreshed within this many seconds, regardless of PID
+    # liveness (set <= 0 to disable age-based expiry). Guards against signals
+    # stuck after a session moves on, since the recorded PID is the login shell.
+    "signal_max_age": 1800,
 }
 
 _ENV_MAP: dict[str, tuple[str, type]] = {
@@ -96,12 +105,14 @@ _ENV_MAP: dict[str, tuple[str, type]] = {
     "color_g": ("COLOR_G", int),
     "color_b": ("COLOR_B", int),
     "interval": ("INTERVAL", float),
+    "flash_enabled": ("FLASH_ENABLED", lambda v: v.lower() == "true"),
     "badge_enabled": ("BADGE_ENABLED", lambda v: v.lower() == "true"),
     "badge": ("BADGE", str),
     "notify": ("NOTIFY", lambda v: v.lower() == "true"),
     "sound": ("SOUND", str),
     "display_target": ("DISPLAY_TARGET", str),
     "subtitle_activity_source": ("SUBTITLE_ACTIVITY_SOURCE", str),
+    "signal_max_age": ("SIGNAL_MAX_AGE", int),
 }
 
 _DISPLAY_TARGETS = {"title", "subtitle", "both"}
@@ -276,6 +287,32 @@ def _is_pid_alive(pid: int) -> bool:
         return True  # process exists but we can't signal it
 
 
+def is_signal_stale(
+    sig: dict,
+    now: float,
+    max_age: int,
+    pid_alive: Callable[[int], bool] = _is_pid_alive,
+) -> bool:
+    """Return True if a signal file should be reclaimed.
+
+    A signal is stale when it has aged past ``max_age`` (set ``max_age <= 0`` to
+    disable age-based expiry). Age expiry is independent of PID liveness because
+    the recorded PID is the long-lived login shell, so a finished session's
+    signal (e.g. a stuck ``attention``) would otherwise never be reclaimed while
+    the terminal tab stays open. Every hook event rewrites the signal's ``ts``,
+    so an active session is never reclaimed by this path.
+    """
+    try:
+        pid = int(sig.get("pid", "0"))
+        ts = int(sig.get("ts", "0"))
+    except (ValueError, TypeError):
+        return False
+    age = now - ts
+    dead_pid = pid > 0 and age > _PID_STALE_GRACE and not pid_alive(pid)
+    too_old = max_age > 0 and age > max_age
+    return dead_pid or too_old
+
+
 # --- Snapshot ---
 
 
@@ -437,6 +474,28 @@ def set_state_prefix(name: str, prefix: str) -> str:
     return prefix + strip_all_prefixes(name)
 
 
+def escape_interpolation(text: str) -> str:
+    """Quote ``text`` for literal use inside an iTerm2 interpolated string.
+
+    Backslash opens an escape sequence there, so an unescaped prefix containing
+    one (``\\(`` above all) would be evaluated as an expression instead of shown.
+    """
+    return text.replace("\\", "\\\\")
+
+
+def is_plugin_tab_override(override: str) -> bool:
+    """Whether a tab title override was written by this plugin.
+
+    Matches the escaped prefix because that is what gets written out. Empty
+    prefixes are skipped: every string starts with ``""``, so a state the user
+    opted out of would otherwise match every tab and claim overrides this
+    plugin never set.
+    """
+    return bool(override) and any(
+        override.startswith(escape_interpolation(p)) for p in ALL_PREFIXES if p
+    )
+
+
 _SUBTITLE_VARIABLE = "user.claudeStatus"
 _ACTIVITY_MAX_CHARS = 18
 _ACTIVITY_MAX_WORDS = 2
@@ -513,7 +572,14 @@ def _activity_snippet(text: object) -> str:
     cleaned = re.sub(r"(?:~|/)[^\s]+", " file ", cleaned)
     cleaned = re.sub(r"(?i)\bpull\s+request\b", " PR ", cleaned)
     cleaned = re.sub(r"[\r\n\t]+", " ", cleaned)
-    cleaned = re.sub(r"[^A-Za-z0-9#]+", " ", cleaned)
+    # Keep Unicode letters and numbers (categories L*/N*) plus '#'. Everything else
+    # — control chars, zero-width, bidi overrides, punctuation, symbols — becomes a
+    # space. This broadens the previous ASCII-only whitelist to support non-English
+    # prompts while preserving the same sanitization profile (categories L and N are
+    # safe to render; control / format / mark categories are still stripped).
+    cleaned = "".join(
+        c if (c == "#" or unicodedata.category(c)[0] in "LN") else " " for c in cleaned
+    )
 
     words = [word for word in cleaned.split() if word.lower() not in _ACTIVITY_STOP_WORDS]
     if not words:
@@ -602,8 +668,9 @@ async def _handle_display_target_change(
             tab = info.get("tab")
             try:
                 if tab:
-                    displayed = await tab.async_get_variable("title") or info["snapshot"].name
-                    await tab.async_set_title(strip_all_prefixes(displayed))
+                    # Drop our prefixed override, restoring whatever override
+                    # (usually none) the tab had before we touched it.
+                    await tab.async_set_title(info.get("orig_tab_title", ""))
                 else:
                     clean = strip_all_prefixes(info["snapshot"].name)
                     await info["session"].async_set_name(clean)  # type: ignore[union-attr]
@@ -742,13 +809,24 @@ async def main(connection: object) -> None:
         return None
 
     async def _set_tab_title(info: dict, prefix: str) -> None:
-        """Set tab title with given prefix."""
+        """Set tab title with given prefix.
+
+        The override is an iTerm2 *interpolated* string that references the
+        live session name, so titles set by the running application (e.g.
+        Claude Code's OSC 0 task summaries, which update continuously) keep
+        flowing into the tab title. Writing the literal title text instead
+        would freeze the tab at whatever the title happened to be at
+        state-change time — usually "Claude Code" from before the first
+        summary was generated.
+
+        The prefix is applied on top of the tab's own override when it had one,
+        so a user's custom title format survives for the session's lifetime.
+        """
         tab = info.get("tab")
         if tab:
             try:
-                displayed = await tab.async_get_variable("title") or info["snapshot"].name
-                clean = strip_all_prefixes(displayed)
-                await tab.async_set_title(set_state_prefix(clean, prefix))
+                base = info.get("orig_tab_title") or r"\(currentSession.name)"
+                await tab.async_set_title(escape_interpolation(prefix) + base)
             except Exception:
                 log.debug("tab.async_set_title failed, falling back to session name")
                 tab = None
@@ -758,6 +836,49 @@ async def main(connection: object) -> None:
             await info["session"].async_set_name(  # type: ignore[union-attr]
                 set_state_prefix(clean, prefix)
             )
+
+    def _start_flash(claude_sid: str) -> None:
+        """Begin flashing a session's tab (idempotent)."""
+        info = active.get(claude_sid)
+        if not info or flasher.is_flashing(claude_sid):
+            return
+        flasher.start(claude_sid)
+        info["flash_task"] = asyncio.create_task(
+            _flash_loop(info["session"], info["snapshot"], claude_sid, flasher)
+        )
+
+    async def _stop_flash(claude_sid: str, restore_color: bool = False) -> None:
+        """Stop a session's flash loop, optionally restoring its tab color.
+
+        ``restore_color`` puts the tab color back to its captured value while
+        leaving the badge in place — used when the flash is turned off via
+        hot-reload but the session is still in the attention state.
+        """
+        info = active.get(claude_sid)
+        if not info:
+            return
+        flasher.stop(claude_sid)
+        task = info.get("flash_task")
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            info["flash_task"] = None
+        if restore_color:
+            snapshot = info["snapshot"]
+            change = iterm2.LocalWriteOnlyProfile()
+            change.set_use_tab_color(snapshot.use_tab_color)
+            if snapshot.tab_color is not None:
+                change.set_tab_color(
+                    iterm2.Color(
+                        snapshot.tab_color["red"],
+                        snapshot.tab_color["green"],
+                        snapshot.tab_color["blue"],
+                    )
+                )
+            await info["session"].async_set_profile_properties(change)  # type: ignore[union-attr]
 
     async def _enter_state(claude_sid: str, state: TabState, signal: dict) -> None:
         """Apply visual treatment for entering a state."""
@@ -774,11 +895,8 @@ async def main(connection: object) -> None:
                 badge_change.set_badge_text(CONFIG["badge"])
                 await info["session"].async_set_profile_properties(badge_change)  # type: ignore[union-attr]
 
-            flasher.start(claude_sid)
-            task = asyncio.create_task(
-                _flash_loop(info["session"], info["snapshot"], claude_sid, flasher)
-            )
-            info["flash_task"] = task
+            if CONFIG["flash_enabled"]:
+                _start_flash(claude_sid)
 
             project = signal.get("project", "")
             msg = signal.get("message", "Needs attention")
@@ -794,17 +912,23 @@ async def main(connection: object) -> None:
             return
         state = info.get("state")
         if state == TabState.ATTENTION:
-            flasher.stop(claude_sid)
-            task = info.get("flash_task")
-            if task:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                info["flash_task"] = None
+            await _stop_flash(claude_sid)
             # Restore tab color + badge
             await restore_snapshot(info["session"], info["snapshot"])
+
+    async def _reconcile_flash_enabled(enabled: bool) -> None:
+        """Apply a hot-reloaded ``flash_enabled`` change to active attention tabs.
+
+        Turning the flash off stops any in-progress flash and restores the tab
+        color immediately (the badge stays); turning it back on resumes flashing.
+        """
+        for claude_sid, info in list(active.items()):
+            if info.get("state") != TabState.ATTENTION:
+                continue
+            if enabled:
+                _start_flash(claude_sid)
+            else:
+                await _stop_flash(claude_sid, restore_color=True)
 
     async def apply_state(claude_sid: str, signal: dict) -> None:
         """Entry point for processing a signal. Handles new sessions and state transitions."""
@@ -826,6 +950,11 @@ async def main(connection: object) -> None:
             if tab:
                 try:
                     orig_tab_title = await tab.async_get_variable("titleOverrideFormat") or ""
+                    # A split pane sharing this tab may already carry our own
+                    # override; adopting it would stack prefixes and later
+                    # "restore" it as if the user had set it.
+                    if is_plugin_tab_override(orig_tab_title):
+                        orig_tab_title = ""
                 except Exception:
                     tab = None
 
@@ -865,11 +994,8 @@ async def main(connection: object) -> None:
         tab = info.get("tab")
         if tab:
             try:
-                orig = info.get("orig_tab_title", "")
-                if orig:
-                    await tab.async_set_title(orig)
-                else:
-                    await tab.async_set_title("")  # Clear override → back to default
+                # "" clears our override, putting the tab back on its default title.
+                await tab.async_set_title(info.get("orig_tab_title", ""))
             except Exception:
                 pass
         # If state was not attention, we also need to restore snapshot
@@ -882,6 +1008,7 @@ async def main(connection: object) -> None:
     async def signal_watcher() -> None:
         prev_signals: dict[str, dict] = {}
         last_display_target = CONFIG["display_target"]
+        last_flash_enabled = CONFIG["flash_enabled"]
         while True:
             _check_config_reload()
             current_display_target = CONFIG["display_target"]
@@ -890,6 +1017,10 @@ async def main(connection: object) -> None:
                     active, last_display_target, current_display_target, _set_tab_title
                 )
                 last_display_target = current_display_target
+            current_flash_enabled = CONFIG["flash_enabled"]
+            if current_flash_enabled != last_flash_enabled:
+                await _reconcile_flash_enabled(current_flash_enabled)
+                last_flash_enabled = current_flash_enabled
             try:
                 signals = read_signals(CONFIG["dir"])
                 current_sids = set(signals.keys())
@@ -917,16 +1048,13 @@ async def main(connection: object) -> None:
                         await clear_session(sid)
                         remove_signal(CONFIG["dir"], sid)
 
-                # PID liveness: clean stale signals
+                # Clean stale signals: dead PID, or aged past signal_max_age
+                # (the recorded PID is the login shell, so age expiry is what
+                # reclaims signals stuck after a session moves on).
                 now = time.time()
                 for sid, sig in list(signals.items()):
-                    try:
-                        pid = int(sig.get("pid", "0"))
-                        ts = int(sig.get("ts", "0"))
-                    except (ValueError, TypeError):
-                        continue
-                    if pid > 0 and (now - ts) > _PID_STALE_GRACE and not _is_pid_alive(pid):
-                        log.info("Stale signal %s (PID %d dead), cleaning up", sid, pid)
+                    if is_signal_stale(sig, now, CONFIG["signal_max_age"]):
+                        log.info("Stale signal %s, cleaning up", sid)
                         await clear_session(sid)
                         remove_signal(CONFIG["dir"], sid)
 
@@ -934,6 +1062,21 @@ async def main(connection: object) -> None:
             except Exception:
                 log.exception("Error in signal watcher")
             await asyncio.sleep(1)
+
+    # Heal stale title overrides left by previous adapter runs: a crash or
+    # iTerm2 restart loses the in-memory session map, so tabs can keep a
+    # prefixed override forever. Any tab still carrying one of our prefixes is
+    # unknown to this fresh instance — clear it; live sessions get re-applied
+    # by signal_watcher within a second.
+    async def cleanup_stale_overrides() -> None:
+        for w in app.terminal_windows:
+            for tab in w.tabs:
+                try:
+                    override = await tab.async_get_variable("titleOverrideFormat")
+                    if is_plugin_tab_override(override or ""):
+                        await tab.async_set_title("")
+                except Exception:
+                    log.debug("Startup override cleanup failed for a tab", exc_info=True)
 
     # Focus monitor: event-driven via iTerm2 FocusMonitor
     async def focus_monitor() -> None:
@@ -946,6 +1089,7 @@ async def main(connection: object) -> None:
                         focus_tracker.set_focused(session_id)
 
     # Run both concurrently
+    await cleanup_stale_overrides()
     await asyncio.gather(signal_watcher(), focus_monitor())
 
 

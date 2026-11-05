@@ -385,6 +385,21 @@ class TestDisplayTargetHelpers:
         signal = {"activity": "   "}
         assert claude_tab_status._subtitle_status_text("⚡ ", signal) == "⚡"
 
+    def test_subtitle_status_text_preserves_swedish_letters(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setitem(claude_tab_status.CONFIG, "subtitle_activity_source", "prompt")
+        signal = {"activity": "kör testerna"}
+        assert claude_tab_status._subtitle_status_text("⚡ ", signal) == "⚡ Kör testerna"
+
+    def test_subtitle_status_text_preserves_german_letters(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setitem(claude_tab_status.CONFIG, "subtitle_activity_source", "prompt")
+        signal = {"activity": "führe Tests aus"}
+        assert claude_tab_status._subtitle_status_text("⚡ ", signal) == "⚡ Führe tests"
+
+    def test_subtitle_status_text_preserves_japanese_letters(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setitem(claude_tab_status.CONFIG, "subtitle_activity_source", "prompt")
+        signal = {"activity": "テストを実行"}
+        assert claude_tab_status._subtitle_status_text("⚡ ", signal) == "⚡ テストを実行"
+
     @pytest.mark.asyncio
     async def test_set_subtitle_status_uses_fixed_user_variable(self):
         session = MagicMock()
@@ -571,6 +586,7 @@ class TestConfig:
         assert cfg["color_g"] == 140
         assert cfg["color_b"] == 0
         assert cfg["interval"] == 0.6
+        assert cfg["flash_enabled"] is True
         assert cfg["badge_enabled"] is True
         assert cfg["badge"] == "⚠️ Needs input"
         assert cfg["notify"] is False
@@ -666,6 +682,19 @@ class TestConfig:
         monkeypatch.setenv("CLAUDE_ITERM2_TAB_STATUS_BADGE_ENABLED", "false")
         cfg = claude_tab_status.load_config(str(tmp_path / "nonexistent.json"))
         assert cfg["badge_enabled"] is False
+
+    def test_flash_enabled_false(self, tmp_path: Path):
+        """flash_enabled=false is respected."""
+        cfg_file = tmp_path / "config.json"
+        cfg_file.write_text(json.dumps({"flash_enabled": False}))
+        cfg = claude_tab_status.load_config(str(cfg_file))
+        assert cfg["flash_enabled"] is False
+
+    def test_env_flash_enabled_false(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        """Env var FLASH_ENABLED=false overrides default."""
+        monkeypatch.setenv("CLAUDE_ITERM2_TAB_STATUS_FLASH_ENABLED", "false")
+        cfg = claude_tab_status.load_config(str(tmp_path / "nonexistent.json"))
+        assert cfg["flash_enabled"] is False
 
 
 # --- TestHotReload ---
@@ -807,3 +836,198 @@ class TestDisplayTargetHotReload:
 
         assert "_handle_display_target_change(" in watcher
         assert "last_display_target" in watcher
+
+
+# --- TestFlashEnabled ---
+
+
+class TestFlashEnabled:
+    def test_enter_state_gates_flash_on_config(self):
+        source = inspect.getsource(claude_tab_status.main)
+        enter_state = source.split("    async def _enter_state", 1)[1].split(
+            "    async def _leave_state", 1
+        )[0]
+
+        assert 'if CONFIG["flash_enabled"]:' in enter_state
+        assert "_start_flash(claude_sid)" in enter_state
+
+    def test_signal_watcher_reconciles_flash_enabled_change(self):
+        source = inspect.getsource(claude_tab_status.main)
+        watcher = source.split("    async def signal_watcher", 1)[1].split(
+            "    # Focus monitor", 1
+        )[0]
+
+        assert "_reconcile_flash_enabled(" in watcher
+        assert "last_flash_enabled" in watcher
+
+
+class TestSignalStaleness:
+    """is_signal_stale() decides when a signal file should be reclaimed.
+
+    Covers the age-based expiry that fixes signals stuck "attention" after a
+    session moves on: the recorded PID is the long-lived login shell, so the
+    dead-PID path alone never reclaims them.
+    """
+
+    GRACE = claude_tab_status._PID_STALE_GRACE
+
+    def test_live_pid_past_max_age_is_stale(self):
+        # The fix: an un-refreshed signal expires even though its PID is alive.
+        sig = {"pid": "12345", "ts": "1000"}
+        assert claude_tab_status.is_signal_stale(
+            sig, now=1000 + 1801, max_age=1800, pid_alive=lambda _pid: True
+        )
+
+    def test_dead_pid_past_grace_is_stale(self):
+        # Preserves the original dead-PID cleanup (closed tabs).
+        sig = {"pid": "999999", "ts": "1000"}
+        assert claude_tab_status.is_signal_stale(
+            sig, now=1000 + self.GRACE + 1, max_age=1800, pid_alive=lambda _pid: False
+        )
+
+    def test_live_pid_within_max_age_is_not_stale(self):
+        sig = {"pid": "12345", "ts": "1000"}
+        assert not claude_tab_status.is_signal_stale(
+            sig, now=1000 + 60, max_age=1800, pid_alive=lambda _pid: True
+        )
+
+    def test_dead_pid_within_grace_is_not_stale(self):
+        sig = {"pid": "999999", "ts": "1000"}
+        assert not claude_tab_status.is_signal_stale(
+            sig, now=1000 + self.GRACE - 1, max_age=1800, pid_alive=lambda _pid: False
+        )
+
+    def test_max_age_zero_disables_age_expiry(self):
+        # Live PID, ancient signal, but age expiry off -> kept.
+        sig = {"pid": "12345", "ts": "1000"}
+        assert not claude_tab_status.is_signal_stale(
+            sig, now=1000 + 10_000_000, max_age=0, pid_alive=lambda _pid: True
+        )
+
+    def test_malformed_ts_is_not_stale(self):
+        sig = {"pid": "12345", "ts": "not-a-number"}
+        assert not claude_tab_status.is_signal_stale(
+            sig, now=9_999_999, max_age=1800, pid_alive=lambda _pid: True
+        )
+
+    def test_signal_max_age_has_config_default(self):
+        cfg = claude_tab_status.load_config("/nonexistent/path/config.json")
+        assert "signal_max_age" in cfg
+        assert isinstance(cfg["signal_max_age"], int)
+        assert cfg["signal_max_age"] > 0
+
+    def test_signal_max_age_overridable_via_env(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setenv("CLAUDE_ITERM2_TAB_STATUS_SIGNAL_MAX_AGE", "120")
+        cfg = claude_tab_status.load_config("/nonexistent/path/config.json")
+        assert cfg["signal_max_age"] == 120
+
+    def test_signal_watcher_uses_is_signal_stale(self):
+        source = inspect.getsource(claude_tab_status.main)
+        watcher = source.split("    async def signal_watcher", 1)[1].split(
+            "    # Focus monitor", 1
+        )[0]
+        assert "is_signal_stale(" in watcher
+        assert 'CONFIG["signal_max_age"]' in watcher
+
+
+class TestLiveTabTitle:
+    """The tab title override must track the live session name, not freeze it.
+
+    Applications like Claude Code continuously retitle the session via OSC 0
+    (task summaries). Writing literal title text as the override freezes the
+    tab at state-change time; an interpolated reference keeps it live.
+    """
+
+    def test_set_tab_title_uses_interpolated_session_name(self):
+        source = inspect.getsource(claude_tab_status.main)
+        set_tab_title = source.split("    async def _set_tab_title", 1)[1].split(
+            "    def _start_flash", 1
+        )[0]
+
+        assert r"\(currentSession.name)" in set_tab_title
+        # The frozen-literal pattern must not come back
+        assert 'async_get_variable("title")' not in set_tab_title
+        # The prefix is user config landing in an interpolated string
+        assert "escape_interpolation(prefix)" in set_tab_title
+        # A user's own title format is kept as the base, not discarded
+        assert 'info.get("orig_tab_title") or r"\\(currentSession.name)"' in set_tab_title
+
+    def test_capture_rejects_our_own_override_as_original(self):
+        """Split panes share a tab, so the captured override may be ours."""
+        source = inspect.getsource(claude_tab_status.main)
+        apply_state = source.split("    async def apply_state", 1)[1].split(
+            "    async def clear_session", 1
+        )[0]
+
+        assert "is_plugin_tab_override(orig_tab_title)" in apply_state
+
+    def test_display_target_change_restores_original_override(self):
+        source = inspect.getsource(claude_tab_status._handle_display_target_change)
+
+        assert 'info.get("orig_tab_title", "")' in source
+        assert 'async_get_variable("title")' not in source
+
+    def test_main_cleans_stale_overrides_before_watching(self):
+        source = inspect.getsource(claude_tab_status.main)
+
+        assert "async def cleanup_stale_overrides" in source
+        assert "await cleanup_stale_overrides()" in source
+        cleanup = source.split("    async def cleanup_stale_overrides", 1)[1].split(
+            "    # Focus monitor", 1
+        )[0]
+        assert 'async_get_variable("titleOverrideFormat")' in cleanup
+        assert "is_plugin_tab_override(" in cleanup
+
+    def test_clear_session_restores_original_override(self):
+        source = inspect.getsource(claude_tab_status.main)
+        clear_session = source.split("    async def clear_session", 1)[1].split(
+            "    # Signal watcher", 1
+        )[0]
+
+        assert 'async_set_title(info.get("orig_tab_title", ""))' in clear_session
+
+
+class TestIsPluginTabOverride:
+    """Only overrides this plugin actually wrote may be cleared at startup."""
+
+    def test_matches_our_prefixed_overrides(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(claude_tab_status, "ALL_PREFIXES", ["⚡ ", "💤 ", "🔴 "])
+
+        assert claude_tab_status.is_plugin_tab_override("⚡ Claude Code")
+        assert claude_tab_status.is_plugin_tab_override("💤 ⠂ Claude Code")
+
+    def test_ignores_foreign_and_empty_overrides(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(claude_tab_status, "ALL_PREFIXES", ["⚡ ", "💤 ", "🔴 "])
+
+        assert not claude_tab_status.is_plugin_tab_override("")
+        assert not claude_tab_status.is_plugin_tab_override(r"\(currentSession.name) — prod")
+
+    def test_empty_prefix_does_not_match_every_override(self, monkeypatch: pytest.MonkeyPatch):
+        """An opted-out state must not turn the startup cleanup into a wipe-all."""
+        monkeypatch.setattr(claude_tab_status, "ALL_PREFIXES", ["⚡ ", "", "🔴 "])
+
+        assert not claude_tab_status.is_plugin_tab_override("my own tab title")
+        # The states still carrying a prefix keep matching
+        assert claude_tab_status.is_plugin_tab_override("⚡ Claude Code")
+
+    def test_matches_an_override_layered_on_a_custom_format(self, monkeypatch: pytest.MonkeyPatch):
+        """What a split pane sees is our prefix on top of the user's own format."""
+        monkeypatch.setattr(claude_tab_status, "ALL_PREFIXES", ["⚡ ", "💤 ", "🔴 "])
+
+        assert claude_tab_status.is_plugin_tab_override(r"⚡ \(currentSession.name) — prod")
+
+    def test_matches_the_escaped_form_that_gets_written(self, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.setattr(claude_tab_status, "ALL_PREFIXES", [r"\(pid) "])
+        written = claude_tab_status.escape_interpolation(r"\(pid) ") + "Claude Code"
+
+        assert claude_tab_status.is_plugin_tab_override(written)
+
+
+class TestEscapeInterpolation:
+    """Prefixes are user config and land inside an iTerm2 interpolated string."""
+
+    def test_leaves_ordinary_prefixes_untouched(self):
+        assert claude_tab_status.escape_interpolation("⚡ ") == "⚡ "
+
+    def test_escapes_backslashes_so_prefixes_are_not_evaluated(self):
+        assert claude_tab_status.escape_interpolation(r"\(pid) ") == r"\\(pid) "
