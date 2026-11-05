@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.2 — 2026-11-04
+
+### Fixed
+- **Plugin updates no longer fail on the fork's marketplace entry.** Claude Code refuses `"source": "./."` with `does not stay inside its marketplace directory`, so the entry now uses the `github` source form.
+
 ## 0.5.1 — 2026-11-04
 
 ### Fixed

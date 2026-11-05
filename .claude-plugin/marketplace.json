@@ -6,7 +6,10 @@
   "plugins": [
     {
       "name": "iterm2-tab-status",
-      "source": "./."
+      "source": {
+        "source": "github",
+        "repo": "ftlpickleball/claude-code-iterm2-tab-status"
+      }
     }
   ]
 }
