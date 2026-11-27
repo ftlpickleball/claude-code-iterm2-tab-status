@@ -38,13 +38,13 @@ read_field() {
 
 echo "=== Notification hook tests ==="
 
-# Test 1: idle_prompt → creates signal with type "idle"
-echo "Test 1: idle_prompt creates signal with type 'idle'"
+# Test 1: idle_prompt → creates signal with type "attention"
+echo "Test 1: idle_prompt creates signal with type 'attention'"
 DIR1="$TMPDIR_BASE/t1"
 run_hook "$DIR1" '{"session_id":"ses-abc-123","hook_event_name":"Notification","notification_type":"idle_prompt","message":"Claude is idle","cwd":"/Users/me/myproject"}'
 if [[ -f "$DIR1/ses-abc-123.json" ]]; then
   typ=$(read_field "$DIR1/ses-abc-123.json" "type")
-  [[ "$typ" == "idle" ]] && pass "type is 'idle'" || fail "type" "expected 'idle', got '$typ'"
+  [[ "$typ" == "attention" ]] && pass "type is 'attention'" || fail "type" "expected 'attention', got '$typ'"
 else
   fail "Signal file not created" "expected $DIR1/ses-abc-123.json"
 fi
@@ -104,7 +104,7 @@ if [[ -f "$DIR5/ses-minimal.json" ]]; then
   pass "Signal created with minimal JSON"
   msg=$(read_field "$DIR5/ses-minimal.json" "message")
   proj=$(read_field "$DIR5/ses-minimal.json" "project")
-  pass "message fallback: '$msg'"
+  [[ "$msg" == "Claude is waiting for your input" ]] && pass "message fallback" || fail "message fallback" "got '$msg'"
   pass "project fallback: '$proj'"
 else
   fail "Minimal JSON" "signal file not created"
@@ -150,15 +150,18 @@ else
   fail "JSON injection" "signal file not created"
 fi
 
-# Test 9: Overwrite — running signal then idle signal for same session
-echo "Test 9: Signal overwrite (running → idle)"
+# Test 9: Overwrite — running, then Stop, then idle_prompt for same session
+echo "Test 9: Signal overwrite (running → idle → attention)"
 DIR9="$TMPDIR_BASE/t9"
 run_hook "$DIR9" '{"session_id":"ses-overwrite","hook_event_name":"UserPromptSubmit","cwd":"/proj"}'
 typ=$(read_field "$DIR9/ses-overwrite.json" "type")
 [[ "$typ" == "running" ]] && pass "Initially 'running'" || fail "Initial type" "expected 'running', got '$typ'"
+run_hook "$DIR9" '{"session_id":"ses-overwrite","hook_event_name":"Stop","cwd":"/proj"}'
+typ=$(read_field "$DIR9/ses-overwrite.json" "type")
+[[ "$typ" == "idle" ]] && pass "Stop overwrites to 'idle'" || fail "Stop type" "expected 'idle', got '$typ'"
 run_hook "$DIR9" '{"session_id":"ses-overwrite","hook_event_name":"Notification","notification_type":"idle_prompt","message":"done","cwd":"/proj"}'
 typ=$(read_field "$DIR9/ses-overwrite.json" "type")
-[[ "$typ" == "idle" ]] && pass "Overwritten to 'idle'" || fail "Overwritten type" "expected 'idle', got '$typ'"
+[[ "$typ" == "attention" ]] && pass "idle_prompt overwrites to 'attention'" || fail "idle_prompt type" "expected 'attention', got '$typ'"
 
 # Test 10: No session_id → exits cleanly
 echo "Test 10: No session_id exits cleanly"
@@ -309,6 +312,19 @@ if echo '{"session_id":"ses-unwritable","hook_event_name":"PreToolUse","tool_nam
   pass "exit 0 on unwritable status dir"
 else
   fail "non-blocking exit" "hook exited non-zero (exit 2 would deny the tool call)"
+fi
+
+# Test 23: unrecognised notification types stay "idle"
+echo "Test 23: unknown notification_type creates signal with type 'idle'"
+DIR23="$TMPDIR_BASE/t23"
+run_hook "$DIR23" '{"session_id":"ses-unknown","hook_event_name":"Notification","notification_type":"auth_success","cwd":"/proj"}'
+if [[ -f "$DIR23/ses-unknown.json" ]]; then
+  typ=$(read_field "$DIR23/ses-unknown.json" "type")
+  [[ "$typ" == "idle" ]] && pass "type is 'idle'" || fail "type" "expected 'idle', got '$typ'"
+  msg=$(read_field "$DIR23/ses-unknown.json" "message")
+  [[ -z "$msg" ]] && pass "no fallback message" || fail "message" "got '$msg'"
+else
+  fail "unknown notification signal" "file not created"
 fi
 
 echo ""

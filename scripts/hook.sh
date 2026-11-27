@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # claude-code-iterm2-tab-status unified hook
-# Handles Notification, UserPromptSubmit, and AskUserQuestion tool events.
-#   Notification(idle_prompt)       → writes signal with type "idle"
+# Handles Notification, Stop, UserPromptSubmit, and AskUserQuestion tool events.
+#   Notification(idle_prompt)       → writes signal with type "attention"
 #   Notification(permission_prompt) → writes signal with type "attention"
+#   Stop                            → writes signal with type "idle"
 #   UserPromptSubmit                → writes signal with type "running"
 #   PreToolUse(AskUserQuestion)     → writes signal with type "attention"
 #   PostToolUse(AskUserQuestion)    → writes signal with type "running"
@@ -179,13 +180,16 @@ elif [[ "$HOOK_EVENT" == "PreToolUse" || "$HOOK_EVENT" == "PostToolUse" ||
   esac
   ACTIVITY=""
 else
-  # Notification event — map notification_type to signal type
+  # Notification or Stop — Stop carries no notification_type, so it lands on idle
   NOTIF_TYPE="$(extract "notification_type")"
   case "$NOTIF_TYPE" in
-    permission_prompt) SIGNAL_TYPE="attention" ;;
-    *)                 SIGNAL_TYPE="idle" ;;
+    permission_prompt|idle_prompt) SIGNAL_TYPE="attention" ;;
+    *)                             SIGNAL_TYPE="idle" ;;
   esac
   MESSAGE="$(extract "message")"
+  if [[ "$NOTIF_TYPE" == "idle_prompt" && -z "$MESSAGE" ]]; then
+    MESSAGE="Claude is waiting for your input"
+  fi
   ACTIVITY=""
 fi
 

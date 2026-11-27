@@ -8,7 +8,7 @@ Code session.
 Three states:
   Running (⚡)   — Claude is processing. Prefix only, no flash.
   Idle (💤)      — Claude finished. Prefix only, no flash.
-  Attention (🔴) — Claude needs permission. Flash + badge + notification.
+  Attention (🔴) — Claude needs permission or input. Flash + badge + notification.
 
 Configuration:
   Settings are resolved in priority order (highest wins):
