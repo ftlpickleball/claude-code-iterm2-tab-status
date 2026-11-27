@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.3 — 2026-11-27
+
+### Fixed
+- **A session waiting on input now shows 🔴 attention.** `idle_prompt` (60 s without input) mapped to 💤, so a prose question looked finished. Finished sessions also turn 🔴 after 60 s.
+
 ## 0.5.2 — 2026-11-04
 
 ### Fixed

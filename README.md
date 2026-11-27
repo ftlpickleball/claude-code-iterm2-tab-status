@@ -70,9 +70,9 @@ claude plugin uninstall iterm2-tab-status
 | ---------------------------------- | ------ | -------------- | ----- | ---------------- |
 | **Running** — Claude is processing | ⚡      | No change      | No    | No               |
 | **Idle** — Claude finished         | 💤      | No change      | No    | No               |
-| **Attention** — needs permission or an answer | 🔴 | Flashes orange | Yes | Yes |
+| **Attention** — needs permission or an answer, or has waited 60 s for input | 🔴 | Flashes orange | Yes | Yes |
 
-Lifecycle: `User submits → ⚡ → Claude finishes → 💤 → User submits → ⚡ → Claude needs permission or asks a question → 🔴 flash! → User focuses → cleared`
+Lifecycle: `User submits → ⚡ → Claude finishes → 💤 → 60 s without input → 🔴 flash! → User focuses → cleared`. A permission prompt or question goes ⚡ → 🔴 directly.
 
 Your original tab color, title, and badge are saved and restored.
 
@@ -84,7 +84,7 @@ Prefer the prefix/badge without the color flash? Set `"flash_enabled": false` �
 Claude Code hooks → JSON signal file → iTerm2 adapter → tab status
 ```
 
-No screen scraping. Claude Code's official [hooks API](https://docs.anthropic.com/en/docs/claude-code/hooks) writes a signal file on every event. The unified hook handles `UserPromptSubmit` (→ running), `Notification` (→ idle/attention), and the `AskUserQuestion` tool via `PreToolUse`/`PostToolUse`/`PostToolUseFailure` (question shown → attention; answered → running; cancelled or timed out → idle). The iTerm2 adapter polls for signal files and sets the matching tab's prefix, color, and badge by TTY. Only the attention state flashes and shows a badge — running and idle are informational prefixes that persist.
+No screen scraping. Claude Code's official [hooks API](https://docs.anthropic.com/en/docs/claude-code/hooks) writes a signal file on every event. The unified hook handles `UserPromptSubmit` (→ running), `Stop` (→ idle), `Notification` (`permission_prompt`/`idle_prompt` → attention), and the `AskUserQuestion` tool via `PreToolUse`/`PostToolUse`/`PostToolUseFailure` (question shown → attention; answered → running; cancelled or timed out → idle). The iTerm2 adapter polls for signal files and sets the matching tab's prefix, color, and badge by TTY. Only the attention state flashes and shows a badge — running and idle are informational prefixes that persist.
 
 ## Configuration
 
